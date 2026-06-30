@@ -1,36 +1,30 @@
-import { useEffect, useRef } from "react";
-import { T } from "../styles/theme.js";
+import { useEffect, useRef } from 'react'
+import { useGameStore } from '../store/gameStore.js'
 
-export function LogFeed({ log }) {
-  const ref = useRef(null);
+export default function LogFeed() {
+  const log = useGameStore(s => s.log) || []
+  const bottomRef = useRef(null)
+
   useEffect(() => {
-    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
-  }, [log]);
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [log.length])
+
+  function formatTime(ts) {
+    const d = new Date(ts)
+    return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  }
 
   return (
-    <div
-      ref={ref}
-      style={{
-        height: 160,
-        overflowY: "auto",
-        fontFamily: T.mono,
-        fontSize: 11,
-        lineHeight: 1.6,
-        color: T.bAqua,
-        padding: "8px 10px",
-        background: "rgba(0,0,0,0.5)",
-        borderRadius: T.radiusSm,
-        border: `1px solid ${T.bg2}`,
-      }}
-    >
-      {log.slice(-50).map((l, i) => (
-        <div key={i} style={{ opacity: 0.4 + (i / 50) * 0.6 }}>
-          <span style={{ color: T.bg4, marginRight: 6 }}>
-            {new Date(l.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
-          </span>
-          {l.msg}
-        </div>
-      ))}
+    <div className="footer">
+      <div className="log-feed">
+        {log.slice(-50).map((entry, i) => (
+          <div key={i} className={`log-entry ${entry.type}`}>
+            <span className="log-time">{formatTime(entry.time)}</span>
+            <span className="log-text">{entry.text}</span>
+          </div>
+        ))}
+        <div ref={bottomRef} />
+      </div>
     </div>
-  );
+  )
 }

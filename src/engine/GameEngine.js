@@ -1,304 +1,390 @@
-// ─── GAME ENGINE ──────────────────────────────────────────
-// Pure state machine. No React, no DOM, no side effects.
-// Receives state, produces next state. That's it.
-//
-// The UI is a view. This is the truth.
+// Core game engine — pure functions, no side effects
+// Handles tick processing, resource generation, mission progress
 
-import { BUILDINGS, buildingCost } from "./Buildings.js";
-import { PROJECTS, projectReward, isProjectUnlocked } from "./Projects.js";
-import { calcMultipliers, linesPerTick, bugChance, BASE_AGENT_OUTPUT } from "./Agents.js";
-import { prestigeBonus, prestigeThreshold, canPrestige, MILESTONES } from "./Progression.js";
-import { resolveWorkOrderSim } from "./AgentBridge.js";
-import { createRewardLedger, recordProjectShipped, recordAgentOutput, recordTick, recordPrestige } from "./Rewards.js";
-import { RESEARCH_TRACKS, freshResearchState, currentResearchTier, researchPerTick, isResearchMaxed } from "./Research.js";
+import { BUILDINGS, getBuildingCost } from '../data/buildings.js'
+import { getResearchBonus, RESEARCH_TRACKS } from '../data/research.js'
+import { getMissionById } from '../data/missions.js'
+import { getPrestigeBonus } from '../data/tiers.js'
 
-export const TICK_MS = 500;
+// --- Resource caps ---
+const BASE_RESOURCE_CAP = { energy: 500, cycles: 300, credits: Infinity }
 
-// ─── FRESH STATE ──────────────────────────────────────────
-export function freshState(prestLevel = 0) {
+export function getResourceCaps(state) {
+  const vaultLevel = state.buildings.dataVault || 0
+  const mult = 1 + vaultLevel * 0.25
   return {
-    tick: 0,
-    funds: 100,
-    totalEarned: 0,
-    lifetimeEarned: 0, // persists across prestige
-    linesWritten: 0,
-    bugsSquashed: 0,
-    projectsShipped: 0,
-    prestigeLevel: prestLevel,
-    buildings: Object.fromEntries(Object.keys(BUILDINGS).map((k) => [k, 0])),
-    activeProjects: [], // { id, name, progress, total, reward }
-    agents: 0,
-    log: [{ msg: "\u26A1 Command Center online. You are the operator.", t: Date.now() }],
-    milestones: {}, // id -> true
-    rewards: createRewardLedger(),
-    research: freshResearchState(),
-    researchBonuses: { speed: 0, quality: 0, skill: 0, oversight: 0, revenue: 0, memory: 0, agents: 0, slots: 0 },
-    // Save slot
-    savedAt: null,
-  };
+    energy: Math.floor(BASE_RESOURCE_CAP.energy * mult),
+    cycles: Math.floor(BASE_RESOURCE_CAP.cycles * mult),
+    credits: Infinity,
+  }
 }
 
-// ─── DERIVED STATE (computed each render, not stored) ─────
-export function deriveState(state) {
-  const mults = calcMultipliers(state.buildings, BUILDINGS);
-  // Apply research bonuses on top of building multipliers
-  const rb = state.researchBonuses || {};
-  mults.speed += rb.speed || 0;
-  mults.quality += rb.quality || 0;
-  mults.skill += rb.skill || 0;
-  mults.oversight += rb.oversight || 0;
-  mults.revenue += rb.revenue || 0;
-  mults.memory += rb.memory || 0;
-  mults.maxSlots += rb.slots || 0;
-  const effectiveAgents = state.agents + (rb.agents || 0);
-
-  const pBonus = prestigeBonus(state.prestigeLevel);
-  const lpt = linesPerTick(effectiveAgents, mults, pBonus);
-  const bugs = bugChance(mults);
-  const pThreshold = prestigeThreshold(state.prestigeLevel);
-  const canPrest = canPrestige(state.totalEarned, state.prestigeLevel);
-  const rpt = researchPerTick(effectiveAgents, mults.memory, pBonus);
-
-  return { mults, pBonus, lpt, bugs, pThreshold, canPrest, rpt, effectiveAgents };
+// --- Agent capacity ---
+export function getAgentCapacity(state) {
+  const bayLevel = state.buildings.agentBay || 0
+  const research = getResearchBonus(state.research)
+  return 2 + bayLevel * 2 + research.bonusAgents
 }
 
-// ─── GAME TICK ────────────────────────────────────────────
-// Called every TICK_MS. Advances all active projects.
-export function gameTick(state) {
-  const next = { ...state, tick: state.tick + 1 };
-  const { mults, pBonus, lpt, bugs } = deriveState(state);
-  const newLogs = [];
+// --- Mission slots ---
+export function getMissionSlots(state) {
+  const opsLevel = state.buildings.opsCenter || 0
+  const research = getResearchBonus(state.research)
+  return Math.max(1, opsLevel) + research.bonusMissionSlots
+}
 
-  // Distribute lines across active projects
-  const actives = next.activeProjects.map((p) => ({ ...p }));
-  let totalNewLines = 0;
-  let totalBugs = 0;
+// --- Production rates per second ---
+export function getProductionRates(state) {
+  const research = getResearchBonus(state.research)
+  const prestigeBonus = getPrestigeBonus(state.prestigeLevel)
+  const reactorLevel = state.buildings.reactor || 0
+  const quantumLevel = state.buildings.quantumArray || 0
+  const qcLevel = state.buildings.quantumCore || 0
+  const globalMult = 1 + (qcLevel * 0.5)
 
-  if (actives.length > 0 && lpt > 0) {
-    const perProject = lpt / actives.length;
-    const finished = [];
+  // Temp boost
+  let tempMult = 1
+  if (state.tempBoost && state.tempBoost.until > Date.now()) {
+    tempMult = state.tempBoost.multiplier
+  }
 
-    for (let i = actives.length - 1; i >= 0; i--) {
-      const resolved = resolveWorkOrderSim(
-        { projectId: actives[i].id },
-        perProject,
-        bugs
-      );
+  const energyPerSec = (
+    (3 * reactorLevel * (1 + research.energyMultiplier) + research.passiveEnergy)
+    * globalMult * prestigeBonus * tempMult
+  )
+  const cyclesPerSec = (
+    (2 * quantumLevel * (1 + research.cyclesMultiplier) + research.passiveCycles)
+    * globalMult * prestigeBonus * tempMult
+  )
 
-      actives[i].progress += resolved.output.linesWritten;
-      totalNewLines += resolved.output.linesWritten;
-      totalBugs += resolved.output.bugsFound;
+  return { energyPerSec, cyclesPerSec }
+}
 
-      if (actives[i].progress >= actives[i].total) {
-        const reward = projectReward(
-          { reward: actives[i].reward },
-          mults.revenue,
-          pBonus,
-          mults.memory
-        );
-        next.funds += reward;
-        next.totalEarned += reward;
-        next.lifetimeEarned += reward;
-        next.projectsShipped += 1;
-        recordProjectShipped(next.rewards, reward);
-        finished.push({ name: actives[i].name, reward });
-        actives.splice(i, 1);
+// --- Game tick (called every 500ms) ---
+export function gameTick(state, deltaSeconds) {
+  const newState = { ...state }
+  const caps = getResourceCaps(state)
+  const rates = getProductionRates(state)
+  const research = getResearchBonus(state.research)
+  const logs = []
+
+  // 1. Generate resources
+  newState.resources = { ...state.resources }
+  newState.resources.energy = Math.min(caps.energy,
+    state.resources.energy + rates.energyPerSec * deltaSeconds)
+  newState.resources.cycles = Math.min(caps.cycles,
+    state.resources.cycles + rates.cyclesPerSec * deltaSeconds)
+
+  // 2. Progress active missions
+  const missionSpeedMult = 1 + (research.missionSpeedBonus || 0)
+  let missionBoostMult = 1
+  if (state.missionBoost && state.missionBoost.until > Date.now()) {
+    missionBoostMult = state.missionBoost.speedMultiplier
+  }
+
+  newState.activeMissions = []
+  const completedThisTick = []
+  for (const am of state.activeMissions) {
+    const progress = am.progress + deltaSeconds * missionSpeedMult * missionBoostMult
+    if (progress >= am.duration) {
+      completedThisTick.push(am)
+      const mission = getMissionById(am.missionId)
+      if (mission) {
+        newState.resources.credits += mission.reward
+        logs.push({
+          type: 'mission_complete',
+          text: `Mission complete: ${mission.name} — +${mission.reward} ◇`,
+          time: Date.now(),
+        })
       }
-    }
-
-    for (const f of finished) {
-      newLogs.push({ msg: `\u{1F680} SHIPPED: ${f.name} \u2192 +$${fmt(f.reward)}`, t: Date.now() });
+    } else {
+      newState.activeMissions.push({ ...am, progress })
     }
   }
 
-  next.linesWritten += totalNewLines;
-  next.bugsSquashed += totalBugs;
-  next.activeProjects = actives;
+  // Free agents from completed missions
+  newState.agents = state.agents.map(a => {
+    const wasBusy = completedThisTick.some(m => m.agentIds.includes(a.id))
+    if (wasBusy) {
+      const mission = getMissionById(completedThisTick.find(m => m.agentIds.includes(a.id))?.missionId)
+      const xpBonus = 1 + (research.agentXpBonus || 0)
+      const forgeLevel = state.buildings.neuralForge || 0
+      const forgeMult = 1 + forgeLevel * 0.15
+      const xpGain = Math.floor((mission?.xpReward || 10) * xpBonus * forgeMult)
+      const newXp = a.xp + xpGain
+      const newLevel = Math.floor(Math.sqrt(newXp / 50)) + 1
+      return { ...a, status: 'idle', assignedTo: null, xp: newXp, level: Math.min(newLevel, 20) }
+    }
+    return a
+  })
 
-  // Record agent output
-  if (totalNewLines > 0) {
-    recordAgentOutput(next.rewards, totalNewLines, totalBugs, 1 - bugs);
-  }
-  recordTick(next.rewards);
+  // Unlock locked agents
+  newState.agents = newState.agents.map(a => {
+    if (a.status === 'locked' && a.lockUntil && Date.now() >= a.lockUntil) {
+      return { ...a, status: 'idle', lockUntil: null }
+    }
+    return a
+  })
 
-  // Advance active research
-  const research = { ...(next.research || freshResearchState()) };
-  const rBonuses = { ...(next.researchBonuses || { speed: 0, quality: 0, skill: 0, oversight: 0, revenue: 0, memory: 0, agents: 0, slots: 0 }) };
-  const { rpt } = deriveState(state);
+  // Track completed missions
+  newState.completedMissions = [
+    ...state.completedMissions,
+    ...completedThisTick.map(m => ({ missionId: m.missionId, completedAt: Date.now() })),
+  ]
 
-  for (const [trackId, rState] of Object.entries(research)) {
-    if (!rState.active) continue;
-    const tier = currentResearchTier(trackId, rState.level);
-    if (!tier) continue;
-
-    research[trackId] = { ...rState, progress: rState.progress + rpt };
-
-    if (research[trackId].progress >= tier.steps) {
-      // Research complete — apply permanent bonus
-      research[trackId] = { level: rState.level + 1, progress: 0, active: false };
-      const eff = tier.effect;
-      if (eff.type === "agents") {
-        rBonuses.agents = (rBonuses.agents || 0) + eff.value;
+  // 3. Progress active research
+  newState.research = { ...state.research }
+  for (const [trackId, trackState] of Object.entries(state.research)) {
+    if (trackState.active) {
+      const progress = trackState.active.progress + deltaSeconds
+      if (progress >= trackState.active.duration) {
+        newState.research[trackId] = {
+          completed: trackState.completed + 1,
+          active: null,
+        }
+        const track = RESEARCH_TRACKS[trackId]
+        const tier = track?.tiers[trackState.completed]
+        logs.push({
+          type: 'research_complete',
+          text: `Research complete: ${tier?.name || trackId} — ${tier?.desc || ''}`,
+          time: Date.now(),
+        })
       } else {
-        rBonuses[eff.type] = (rBonuses[eff.type] || 0) + eff.value;
+        newState.research[trackId] = {
+          ...trackState,
+          active: { ...trackState.active, progress },
+        }
       }
-      newLogs.push({
-        msg: `\u{1F9EA} RESEARCH: ${tier.name} complete! ${tier.desc}`,
-        t: Date.now(),
-      });
-    }
-  }
-  next.research = research;
-  next.researchBonuses = rBonuses;
-
-  // Check milestones
-  for (const m of MILESTONES) {
-    if (!next.milestones[m.id] && m.check(next)) {
-      next.milestones[m.id] = true;
-      next.funds += m.reward;
-      next.totalEarned += m.reward;
-      next.lifetimeEarned += m.reward;
-      newLogs.push({ msg: `\u{1F3C6} MILESTONE: ${m.msg} +$${fmt(m.reward)}`, t: Date.now() });
     }
   }
 
-  if (newLogs.length > 0) {
-    next.log = [...next.log.slice(-60), ...newLogs];
+  // 4. Update stats
+  newState.stats = { ...state.stats }
+  newState.stats.totalEnergyProduced += rates.energyPerSec * deltaSeconds
+  newState.stats.totalCyclesProduced += rates.cyclesPerSec * deltaSeconds
+  newState.stats.totalMissionsCompleted = newState.completedMissions.length
+  newState.stats.playTime += deltaSeconds
+
+  // 5. Update total credits earned
+  const creditsEarned = completedThisTick.reduce((sum, am) => {
+    const m = getMissionById(am.missionId)
+    return sum + (m?.reward || 0)
+  }, 0)
+  newState.totalCreditsEarned = (state.totalCreditsEarned || 0) + creditsEarned
+
+  newState.tickCount = (state.tickCount || 0) + 1
+
+  return { state: newState, logs }
+}
+
+// --- Actions ---
+export function canBuyBuilding(state, buildingId) {
+  const b = BUILDINGS[buildingId]
+  if (!b) return false
+  const level = state.buildings[buildingId] || 0
+  if (level >= b.maxLevel) return false
+  const cost = getBuildingCost(buildingId, level)
+  return state.resources.credits >= cost
+}
+
+export function buyBuilding(state, buildingId) {
+  const b = BUILDINGS[buildingId]
+  if (!b) return state
+  const level = state.buildings[buildingId] || 0
+  if (level >= b.maxLevel) return state
+  const cost = getBuildingCost(buildingId, level)
+  if (state.resources.credits < cost) return state
+
+  return {
+    ...state,
+    resources: { ...state.resources, credits: state.resources.credits - cost },
+    buildings: { ...state.buildings, [buildingId]: level + 1 },
   }
-
-  return next;
 }
 
-// ─── ACTIONS ──────────────────────────────────────────────
-// Pure functions: state in, state out.
+export function canStartMission(state, missionId) {
+  const mission = getMissionById(missionId)
+  if (!mission) return { ok: false, reason: 'Unknown mission' }
 
-export function buyBuilding(state, id) {
-  const def = BUILDINGS[id];
-  if (!def) return state;
-  const cost = buildingCost(def, state.buildings[id]);
-  if (state.funds < cost) return state;
+  const slots = getMissionSlots(state)
+  if (state.activeMissions.length >= slots) return { ok: false, reason: 'No mission slots available' }
 
-  const next = {
+  const idleAgents = state.agents.filter(a => a.status === 'idle')
+  if (idleAgents.length < mission.agents) return { ok: false, reason: `Need ${mission.agents} idle agents (have ${idleAgents.length})` }
+
+  if (state.resources.energy < mission.energyCost) return { ok: false, reason: `Need ${mission.energyCost} ⚡` }
+  if (state.resources.cycles < mission.cyclesCost) return { ok: false, reason: `Need ${mission.cyclesCost} ◈` }
+
+  return { ok: true }
+}
+
+export function startMission(state, missionId) {
+  const mission = getMissionById(missionId)
+  if (!mission) return state
+  const check = canStartMission(state, missionId)
+  if (!check.ok) return state
+
+  const idleAgents = state.agents.filter(a => a.status === 'idle')
+  const assigned = idleAgents.slice(0, mission.agents)
+  const agentIds = assigned.map(a => a.id)
+
+  return {
     ...state,
-    funds: state.funds - cost,
-    buildings: { ...state.buildings, [id]: state.buildings[id] + 1 },
-    agents: def.effect === "agents" ? state.agents + def.perLevel : state.agents,
-  };
-
-  const msg = def.effect === "agents"
-    ? `\u{1F916} Agent recruited. Squad: ${next.agents}`
-    : `\u{1F527} ${def.name} \u2192 Lv ${next.buildings[id]}`;
-
-  next.log = [...next.log.slice(-60), { msg, t: Date.now() }];
-  return next;
+    resources: {
+      ...state.resources,
+      energy: state.resources.energy - mission.energyCost,
+      cycles: state.resources.cycles - mission.cyclesCost,
+    },
+    agents: state.agents.map(a =>
+      agentIds.includes(a.id)
+        ? { ...a, status: 'mission', assignedTo: missionId }
+        : a
+    ),
+    activeMissions: [
+      ...state.activeMissions,
+      { missionId, agentIds, progress: 0, duration: mission.duration, startedAt: Date.now() },
+    ],
+  }
 }
 
-export function startProject(state, projId) {
-  const proj = PROJECTS.find((p) => p.id === projId);
-  if (!proj) return state;
-  if (state.agents < proj.minAgents) return state;
-  if (state.activeProjects.find((a) => a.id === proj.id)) return state;
-
-  const { mults } = deriveState(state);
-  if (state.activeProjects.length >= mults.maxSlots) return state;
-
-  const next = {
-    ...state,
-    activeProjects: [
-      ...state.activeProjects,
-      { id: proj.id, name: proj.name, progress: 0, total: proj.lines, reward: proj.reward },
-    ],
-    log: [
-      ...state.log.slice(-60),
-      { msg: `\u{1F4CB} Project queued: ${proj.name} (${fmt(proj.lines)} lines)`, t: Date.now() },
-    ],
-  };
-
-  return next;
-}
-
-export function doPrestige(state) {
-  if (!canPrestige(state.totalEarned, state.prestigeLevel)) return state;
-  const newLevel = state.prestigeLevel + 1;
-  const next = freshState(newLevel);
-  next.lifetimeEarned = state.lifetimeEarned;
-  next.rewards = { ...state.rewards };
-  next.milestones = {}; // milestones reset on prestige
-  recordPrestige(next.rewards);
-  next.log = [
-    { msg: `\u{1F31F} PIVOT! Company reborn at Prestige ${newLevel} (${newLevel * 50}% bonus)`, t: Date.now() },
-  ];
-  return next;
+export function canStartResearch(state, trackId, tierIndex) {
+  const track = RESEARCH_TRACKS[trackId]
+  if (!track) return false
+  const trackState = state.research[trackId]
+  if (!trackState) return false
+  if (trackState.active) return false
+  if (trackState.completed !== tierIndex) return false
+  if (tierIndex >= track.tiers.length) return false
+  const tier = track.tiers[tierIndex]
+  return state.resources.cycles >= tier.cost
 }
 
 export function startResearch(state, trackId) {
-  const research = state.research || freshResearchState();
-  const rState = research[trackId];
-  if (!rState || rState.active) return state;
-  if (isResearchMaxed(trackId, rState.level)) return state;
+  const track = RESEARCH_TRACKS[trackId]
+  if (!track) return state
+  const trackState = state.research[trackId]
+  if (!trackState || trackState.active) return state
+  const tierIndex = trackState.completed
+  if (tierIndex >= track.tiers.length) return state
+  const tier = track.tiers[tierIndex]
+  if (state.resources.cycles < tier.cost) return state
 
-  const tier = currentResearchTier(trackId, rState.level);
-  if (!tier || state.funds < tier.cost) return state;
-
-  const next = {
+  return {
     ...state,
-    funds: state.funds - tier.cost,
-    research: { ...research, [trackId]: { ...rState, active: true, progress: 0 } },
-    log: [
-      ...state.log.slice(-60),
-      { msg: `\u{1F52C} Research started: ${tier.name} ($${fmt(tier.cost)})`, t: Date.now() },
+    resources: { ...state.resources, cycles: state.resources.cycles - tier.cost },
+    research: {
+      ...state.research,
+      [trackId]: {
+        ...trackState,
+        active: { tier: tierIndex, progress: 0, duration: tier.duration },
+      },
+    },
+  }
+}
+
+export function recruitAgent(state) {
+  const cap = getAgentCapacity(state)
+  if (state.agents.length >= cap) return state
+  const cost = Math.floor(100 * Math.pow(1.3, state.agents.length))
+  if (state.resources.credits < cost) return state
+
+  const names = ['ARIA', 'NOVA', 'ECHO', 'SAGE', 'FLUX', 'IRIS', 'ONYX', 'VOLT',
+    'NEON', 'APEX', 'ZERO', 'BYTE', 'CORE', 'DASH', 'GRID', 'HACK',
+    'JOLT', 'KILO', 'LYNX', 'MACH', 'NODE', 'OPUS', 'PROX', 'QUARK',
+    'RIFT', 'SYNC', 'TRON', 'UNIT', 'VEX', 'WARP', 'XION', 'ZETA']
+  const id = state.nextAgentId
+  const nameIndex = (id - 1) % names.length
+  const suffix = id <= names.length ? '' : `-${Math.floor((id - 1) / names.length) + 1}`
+
+  return {
+    ...state,
+    resources: { ...state.resources, credits: state.resources.credits - cost },
+    agents: [...state.agents, {
+      id,
+      name: `${names[nameIndex]}${suffix}`,
+      level: 1,
+      xp: 0,
+      status: 'idle',
+      assignedTo: null,
+      lockUntil: null,
+    }],
+    nextAgentId: id + 1,
+  }
+}
+
+export function getRecruitCost(state) {
+  return Math.floor(100 * Math.pow(1.3, state.agents.length))
+}
+
+export function doPrestige(state) {
+  return {
+    ...freshState(),
+    prestigeLevel: state.prestigeLevel + 1,
+    stats: {
+      ...state.stats,
+    },
+    log: [{
+      type: 'prestige',
+      text: `PRESTIGE LEVEL ${state.prestigeLevel + 1} — x${((state.prestigeLevel + 1) * 0.5 + 1).toFixed(1)} all production`,
+      time: Date.now(),
+    }],
+  }
+}
+
+export function freshState() {
+  return {
+    resources: { energy: 0, cycles: 0, credits: 500 },
+    buildings: {},
+    agents: [
+      { id: 1, name: 'ARIA', level: 1, xp: 0, status: 'idle', assignedTo: null, lockUntil: null },
+      { id: 2, name: 'NOVA', level: 1, xp: 0, status: 'idle', assignedTo: null, lockUntil: null },
     ],
-  };
-  return next;
-}
-
-// ─── SAVE / LOAD ──────────────────────────────────────────
-const SAVE_KEY = "agent_command_center_save";
-
-export function saveGame(state) {
-  const toSave = { ...state, savedAt: Date.now() };
-  try {
-    localStorage.setItem(SAVE_KEY, JSON.stringify(toSave));
-    return true;
-  } catch {
-    return false;
+    nextAgentId: 3,
+    research: {
+      power: { completed: 0, active: null },
+      computing: { completed: 0, active: null },
+      command: { completed: 0, active: null },
+      defense: { completed: 0, active: null },
+    },
+    activeMissions: [],
+    completedMissions: [],
+    totalCreditsEarned: 0,
+    prestigeLevel: 0,
+    tempBoost: null,
+    missionBoost: null,
+    activeEvent: null,
+    log: [
+      { type: 'system', text: 'NEXUS COMMAND initialized. Welcome, Commander.', time: Date.now() },
+      { type: 'system', text: 'Build reactors for energy. Build quantum arrays for cycles.', time: Date.now() + 1 },
+      { type: 'system', text: 'Launch missions to earn credits. Good luck.', time: Date.now() + 2 },
+    ],
+    stats: {
+      totalEnergyProduced: 0,
+      totalCyclesProduced: 0,
+      totalCreditsEarned: 0,
+      totalMissionsCompleted: 0,
+      totalAgentsTrained: 0,
+      totalResearchCompleted: 0,
+      totalEventsHandled: 0,
+      playTime: 0,
+    },
+    tickCount: 0,
+    lastTick: Date.now(),
+    lastEventTime: Date.now(),
   }
 }
 
-export function loadGame() {
-  try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (!raw) return null;
-    const saved = JSON.parse(raw);
-    // Restore reward ledger structure if missing (save compat)
-    if (!saved.rewards) saved.rewards = createRewardLedger();
-    if (!saved.milestones) saved.milestones = {};
-    if (!saved.research) saved.research = freshResearchState();
-    if (!saved.researchBonuses) saved.researchBonuses = { speed: 0, quality: 0, skill: 0, oversight: 0, revenue: 0, memory: 0, agents: 0, slots: 0 };
-    if (saved.lifetimeEarned == null) saved.lifetimeEarned = saved.totalEarned || 0;
-    return saved;
-  } catch {
-    return null;
-  }
-}
-
-export function deleteSave() {
-  localStorage.removeItem(SAVE_KEY);
-}
-
-// ─── HELPERS ──────────────────────────────────────────────
+// Number formatting
 export function fmt(n) {
-  if (n >= 1e12) return (n / 1e12).toFixed(1) + "T";
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-  return Math.floor(n).toString();
+  if (n >= 1e12) return (n / 1e12).toFixed(1) + 'T'
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B'
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+  return Math.floor(n).toString()
 }
 
-// Re-export for convenience
-export { BUILDINGS, buildingCost, isBuildingUnlocked } from "./Buildings.js";
-export { PROJECTS, isProjectUnlocked } from "./Projects.js";
-export { calcMultipliers } from "./Agents.js";
-export { prestigeBonus as getPrestigeBonus } from "./Progression.js";
-export { teamScore } from "./Rewards.js";
-export { RESEARCH_TRACKS, currentResearchTier, isResearchMaxed } from "./Research.js";
+export function fmtTime(seconds) {
+  if (seconds < 60) return `${Math.ceil(seconds)}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s`
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
+}
